@@ -699,18 +699,26 @@ class LightMemoPlugin {
         }
 
         const poolById = new Map();
+        // BM25 排名项仅包含 id/score。始终从原始候选表补齐正文和来源，
+        // 避免 documents 中出现 undefined（JSON 序列化后为 null）。
+        const candidateById = new Map(
+            candidates.map(candidate => [Number(candidate.label), candidate])
+        );
         const addToPool = (items, limit = items.length) => {
             items.slice(0, limit).forEach((item, index) => {
                 const id = Number(item.id ?? item.label);
                 if (!Number.isFinite(id)) return;
+                const canonical = candidateById.get(id) || {};
                 const existing = poolById.get(id);
                 const retrievalRank = index + 1;
                 if (!existing || retrievalRank < existing.retrieval_rank) {
                     poolById.set(id, {
+                        ...canonical,
                         ...(existing || {}),
                         ...item,
                         id,
-                        label: item.label ?? id,
+                        label: item.label ?? canonical.label ?? id,
+                        text: String(item.text ?? existing?.text ?? canonical.text ?? '').trim(),
                         retrieval_rank: retrievalRank
                     });
                 }
@@ -734,7 +742,11 @@ class LightMemoPlugin {
             addToPool(runs.v9.top, k);
         }
 
-        const pool = [...poolById.values()];
+        const pool = [...poolById.values()].filter(item => item.text);
+        const droppedCount = poolById.size - pool.length;
+        if (droppedCount > 0) {
+            console.warn(`[LightMemo] TagMemo A/B: dropped ${droppedCount} Rerank candidates without text.`);
+        }
         if (pool.length === 0) {
             return {
                 requested: true,
@@ -1375,7 +1387,30 @@ class LightMemoPlugin {
             console.warn('[LightMemo] Rerank not configured. Skipping.');
             return documents.slice(0, originalK);
         }
-        console.log(`[LightMemo] Starting rerank for ${documents.length} documents.`);
+
+        // Rerank API 要求 query/documents 均为非空字符串；undefined 数组项会被
+        // JSON.stringify 转成 null，部分服务会以 “input cannot be null” 拒绝整批。
+        const normalizedQuery = String(query ?? '').trim();
+        if (!normalizedQuery) {
+            console.warn('[LightMemo] Rerank skipped because query is empty.');
+            return documents.slice(0, originalK);
+        }
+        const validDocuments = documents
+            .map(doc => ({
+                ...doc,
+                text: String(doc?.text ?? '').trim()
+            }))
+            .filter(doc => doc.text);
+        const droppedCount = documents.length - validDocuments.length;
+        if (droppedCount > 0) {
+            console.warn(`[LightMemo] Dropped ${droppedCount} documents without valid text before reranking.`);
+        }
+        if (validDocuments.length === 0) {
+            console.warn('[LightMemo] Rerank skipped because no document contains valid text.');
+            return [];
+        }
+
+        console.log(`[LightMemo] Starting rerank for ${validDocuments.length} documents.`);
 
         const rerankUrl = new URL('v1/rerank', this.rerankConfig.url).toString();
         const headers = {
@@ -1383,13 +1418,13 @@ class LightMemoPlugin {
             'Content-Type': 'application/json',
         };
         const maxTokens = this.rerankConfig.maxTokens;
-        const queryTokens = this._estimateTokens(query);
+        const queryTokens = this._estimateTokens(normalizedQuery);
 
         let batches = [];
         let currentBatch = [];
         let currentTokens = queryTokens;
 
-        for (const doc of documents) {
+        for (const doc of validDocuments) {
             const docTokens = this._estimateTokens(doc.text);
             if (currentTokens + docTokens > maxTokens && currentBatch.length > 0) {
                 batches.push(currentBatch);
@@ -1414,7 +1449,7 @@ class LightMemoPlugin {
             try {
                 const body = {
                     model: this.rerankConfig.model,
-                    query: query,
+                    query: normalizedQuery,
                     documents: docTexts,
                     top_n: docTexts.length
                 };
