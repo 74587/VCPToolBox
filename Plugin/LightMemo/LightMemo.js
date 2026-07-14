@@ -576,6 +576,15 @@ class LightMemoPlugin {
             true,
             'TagMemo A/B BM25'
         );
+        const compareRerank = this._parseBooleanAlias(
+            [
+                ['compare_rerank', args.compare_rerank],
+                ['compareRerank', args.compareRerank],
+                ['rerank_compare', args.rerank_compare]
+            ],
+            false,
+            'TagMemo A/B Rerank comparison'
+        );
 
         const candidates = await this._gatherCandidateChunks({
             maid,
@@ -636,6 +645,19 @@ class LightMemoPlugin {
             };
         }
 
+        const rerankRun = compareRerank
+            ? await this._buildTagMemoABRerankRun({
+                query,
+                candidates,
+                queryVector,
+                runs,
+                abMode,
+                topL,
+                k,
+                useBM25
+            })
+            : null;
+
         if (abMode === 'A') {
             return this._buildAiFriendlyTextResult(this._formatTagMemoKernelAB({
                 query,
@@ -645,7 +667,8 @@ class LightMemoPlugin {
                 topL,
                 k,
                 tagBoost,
-                useBM25
+                useBM25,
+                rerankRun
             }));
         }
 
@@ -654,8 +677,91 @@ class LightMemoPlugin {
             runs,
             k,
             tagBoost,
-            usePotentialField
+            usePotentialField,
+            rerankRun
         }));
+    }
+
+    async _buildTagMemoABRerankRun({ query, candidates, queryVector, runs, abMode, topL, k, useBM25 }) {
+        const configured = Boolean(
+            this.rerankConfig.url &&
+            this.rerankConfig.apiKey &&
+            this.rerankConfig.model
+        );
+        if (!configured) {
+            console.warn('[LightMemo] TagMemo A/B Rerank comparison requested, but Rerank is not configured.');
+            return {
+                requested: true,
+                available: false,
+                error: 'Rerank 未配置（需要 RerankUrl、RerankApi、RerankModel）',
+                ranked: []
+            };
+        }
+
+        const poolById = new Map();
+        const addToPool = (items, limit = items.length) => {
+            items.slice(0, limit).forEach((item, index) => {
+                const id = Number(item.id ?? item.label);
+                if (!Number.isFinite(id)) return;
+                const existing = poolById.get(id);
+                const retrievalRank = index + 1;
+                if (!existing || retrievalRank < existing.retrieval_rank) {
+                    poolById.set(id, {
+                        ...(existing || {}),
+                        ...item,
+                        id,
+                        label: item.label ?? id,
+                        retrieval_rank: retrievalRank
+                    });
+                }
+            });
+        };
+
+        if (abMode === 'A') {
+            const rawRanked = (await this._scoreByVectorSimilarity(candidates, queryVector))
+                .map(item => ({
+                    ...item,
+                    id: item.label,
+                    score: item.vectorScore || 0
+                }))
+                .sort((a, b) => b.score - a.score);
+            addToPool(rawRanked, topL);
+            addToPool(runs.v8_3.ranked, topL);
+            addToPool(runs.v9.ranked, topL);
+            if (useBM25) addToPool(this._buildBm25TopIds(query, candidates, topL), topL);
+        } else {
+            addToPool(runs.v8_3.top, k);
+            addToPool(runs.v9.top, k);
+        }
+
+        const pool = [...poolById.values()];
+        if (pool.length === 0) {
+            return {
+                requested: true,
+                available: false,
+                error: '没有可供 Rerank 横向比较的候选',
+                ranked: []
+            };
+        }
+
+        console.log(`[LightMemo] TagMemo A/B: comparing Rerank on ${pool.length} symmetric candidates.`);
+        const outputLimit = abMode === 'A' ? pool.length : Math.min(k, pool.length);
+        const reranked = await this._rerankDocuments(query, pool, outputLimit);
+        const failedCount = reranked.filter(item => item.rerank_failed).length;
+        const ranked = reranked.map(item => ({
+            ...item,
+            id: item.id ?? item.label,
+            score: Number(item.rerank_score) || 0
+        }));
+
+        return {
+            requested: true,
+            available: failedCount < reranked.length,
+            partialFailure: failedCount > 0 && failedCount < reranked.length,
+            error: failedCount === reranked.length ? 'Rerank API 调用全部失败，未生成有效对比' : null,
+            candidateCount: pool.length,
+            ranked
+        };
     }
 
     _buildBm25TopIds(query, candidates, limit) {
@@ -689,7 +795,7 @@ class LightMemoPlugin {
         return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
     }
 
-    _formatTagMemoKernelAB({ query, candidates, queryVector, runs, topL, k, tagBoost, useBM25 }) {
+    _formatTagMemoKernelAB({ query, candidates, queryVector, runs, topL, k, tagBoost, useBM25, rerankRun }) {
         const rawRanked = candidates
             .map(candidate => ({
                 ...candidate,
@@ -712,6 +818,7 @@ class LightMemoPlugin {
         const rawMap = this._rankMap(rawRanked);
         const v83Map = this._rankMap(runs.v8_3.ranked);
         const v9Map = this._rankMap(runs.v9.ranked);
+        const rerankMap = rerankRun?.available ? this._rankMap(rerankRun.ranked) : new Map();
         const byId = new Map(candidates.map(item => [Number(item.label), item]));
         const ids = [...sources.keys()].sort((a, b) => {
             const bestA = Math.min(rawMap.get(a)?.rank || Infinity, v83Map.get(a)?.rank || Infinity, v9Map.get(a)?.rank || Infinity);
@@ -720,26 +827,38 @@ class LightMemoPlugin {
         });
 
         let text = `\n[--- TagMemo A/B 模式 A：固定对称候选超集测核 ---]\n`;
-        text += `查询: ${query}\n参数: topL=${topL}, displayK=${k}, tag_boost=${tagBoost}, BM25=${useBM25}\n`;
+        text += `查询: ${query}\n参数: topL=${topL}, displayK=${k}, tag_boost=${tagBoost}, BM25=${useBM25}, compare_rerank=${Boolean(rerankRun)}\n`;
         text += `资产: V8.3=${runs.v8_3.snapshot.bundle.artifactSig} | V9=${runs.v9.snapshot.bundle.artifactSig}\n`;
-        text += `对称超集: ${ids.length} 个唯一 chunk（KNN ∪ V8.3 ∪ V9${useBM25 ? ' ∪ BM25' : ''}）\n\n`;
-        text += `| # | 候选记忆 | 进入路径 | KNN排名/分数 | V8.3排名/分数 | V9排名/分数 | ΔRank(V9-V8.3) |\n`;
-        text += `|---:|---|---|---:|---:|---:|---:|\n`;
+        text += `对称超集: ${ids.length} 个唯一 chunk（KNN ∪ V8.3 ∪ V9${useBM25 ? ' ∪ BM25' : ''}）\n`;
+        if (rerankRun) {
+            text += rerankRun.available
+                ? `Rerank横向基线: ${rerankRun.candidateCount} 个对称候选${rerankRun.partialFailure ? '（部分批次失败）' : ''}\n\n`
+                : `Rerank横向基线: 不可用（${rerankRun.error}）\n\n`;
+        } else {
+            text += '\n';
+        }
+        text += `| # | 候选记忆 | 进入路径 | KNN排名/分数 | V8.3排名/分数 | V9排名/分数 | ΔRank(V9-V8.3) |${rerankRun ? ' Rerank排名/分数 | ΔRank(V9-Rerank) |' : ''}\n`;
+        text += `|---:|---|---|---:|---:|---:|---:|${rerankRun ? '---:|---:|' : ''}\n`;
         ids.slice(0, Math.max(k, 30)).forEach((id, index) => {
             const candidate = byId.get(id);
             const raw = rawMap.get(id);
             const oldRun = v83Map.get(id);
             const newRun = v9Map.get(id);
+            const reranked = rerankMap.get(id);
             const delta = oldRun && newRun ? oldRun.rank - newRun.rank : null;
+            const rerankDelta = reranked && newRun ? reranked.rank - newRun.rank : null;
             const fmt = value => value ? `${value.rank}/${value.score.toFixed(4)}` : '—';
-            text += `| ${index + 1} | ${this._escapeMarkdownCell(this._shortMemoryText(candidate?.text))} | ${[...sources.get(id)].join('+')} | ${fmt(raw)} | ${fmt(oldRun)} | ${fmt(newRun)} | ${delta === null ? '—' : delta > 0 ? `+${delta}` : delta} |\n`;
+            const rerankCells = rerankRun
+                ? ` ${fmt(reranked)} | ${rerankDelta === null ? '—' : rerankDelta > 0 ? `+${rerankDelta}` : rerankDelta} |`
+                : '';
+            text += `| ${index + 1} | ${this._escapeMarkdownCell(this._shortMemoryText(candidate?.text))} | ${[...sources.get(id)].join('+')} | ${fmt(raw)} | ${fmt(oldRun)} | ${fmt(newRun)} | ${delta === null ? '—' : delta > 0 ? `+${delta}` : delta} |${rerankCells}\n`;
         });
-        text += `\n说明: 正 ΔRank 表示 V9 相对 V8.3 将候选前移。两版本在完全相同的候选超集上比较，测量传播核与场响应差异，不代表最终产品独立召回收益。\n`;
+        text += `\n说明: 正 ΔRank 表示前者相对后者将候选前移。Rerank（开启时）仅重排同一对称候选池，不扩展召回集合。两版本在完全相同的候选超集上比较，测量传播核与场响应差异，不代表最终产品独立召回收益。\n`;
         text += `[--- 模式 A 结束 ---]\n`;
         return text;
     }
 
-    _formatTagMemoProductAB({ query, runs, k, tagBoost, usePotentialField }) {
+    _formatTagMemoProductAB({ query, runs, k, tagBoost, usePotentialField, rerankRun }) {
         const oldTop = runs.v8_3.top;
         const newTop = runs.v9.top;
         const oldIds = new Set(oldTop.map(item => Number(item.id ?? item.label)));
@@ -749,24 +868,40 @@ class LightMemoPlugin {
         const newOnly = [...newIds].filter(id => !oldIds.has(id));
         const oldMap = this._rankMap(oldTop);
         const newMap = this._rankMap(newTop);
+        const rerankMap = rerankRun?.available ? this._rankMap(rerankRun.ranked) : new Map();
+        const rerankIds = new Set(rerankRun?.available ? rerankRun.ranked.map(item => Number(item.id ?? item.label)) : []);
+        const rerankV83Overlap = [...rerankIds].filter(id => oldIds.has(id)).length;
+        const rerankV9Overlap = [...rerankIds].filter(id => newIds.has(id)).length;
         const items = new Map();
-        [...oldTop, ...newTop].forEach(item => items.set(Number(item.id ?? item.label), item));
-        const union = [...new Set([...newIds, ...oldIds])];
+        [...oldTop, ...newTop, ...(rerankRun?.ranked || [])]
+            .forEach(item => items.set(Number(item.id ?? item.label), item));
+        const union = [...new Set([...newIds, ...oldIds, ...rerankIds])];
 
         let text = `\n[--- TagMemo A/B 模式 B：端到端独立寻址测产品 ---]\n`;
-        text += `查询: ${query}\n参数: k=${k}, tag_boost=${tagBoost}, potential_field=${usePotentialField}\n`;
+        text += `查询: ${query}\n参数: k=${k}, tag_boost=${tagBoost}, potential_field=${usePotentialField}, compare_rerank=${Boolean(rerankRun)}\n`;
         text += `资产: V8.3=${runs.v8_3.snapshot.bundle.artifactSig} | V9=${runs.v9.snapshot.bundle.artifactSig}\n`;
-        text += `重合=${overlap.length}/${k} (${(overlap.length / k * 100).toFixed(1)}%) | V8.3独占=${oldOnly.length} | V9独占=${newOnly.length}\n\n`;
-        text += `| 记忆片段 | V8.3排名/分数 | V9排名/分数 | 归属 |\n`;
-        text += `|---|---:|---:|---|\n`;
+        text += `重合=${overlap.length}/${k} (${(overlap.length / k * 100).toFixed(1)}%) | V8.3独占=${oldOnly.length} | V9独占=${newOnly.length}\n`;
+        if (rerankRun) {
+            text += rerankRun.available
+                ? `Rerank Top-${rerankRun.ranked.length}: 与V8.3重合=${rerankV83Overlap} | 与V9重合=${rerankV9Overlap}${rerankRun.partialFailure ? ' | 部分批次失败' : ''}\n\n`
+                : `Rerank横向基线: 不可用（${rerankRun.error}）\n\n`;
+        } else {
+            text += '\n';
+        }
+        text += `| 记忆片段 | V8.3排名/分数 | V9排名/分数 |${rerankRun ? ' Rerank排名/分数 |' : ''} 归属 |\n`;
+        text += `|---|---:|---:|${rerankRun ? '---:|' : ''}---|\n`;
         union.forEach(id => {
             const oldItem = oldMap.get(id);
             const newItem = newMap.get(id);
-            const owner = oldItem && newItem ? '共同召回' : newItem ? 'V9 独占' : 'V8.3 独占';
+            const reranked = rerankMap.get(id);
+            const owners = [];
+            if (oldItem) owners.push('V8.3');
+            if (newItem) owners.push('V9');
+            if (reranked) owners.push('Rerank');
             const fmt = value => value ? `${value.rank}/${value.score.toFixed(4)}` : '—';
-            text += `| ${this._escapeMarkdownCell(this._shortMemoryText(items.get(id)?.text, 100))} | ${fmt(oldItem)} | ${fmt(newItem)} | ${owner} |\n`;
+            text += `| ${this._escapeMarkdownCell(this._shortMemoryText(items.get(id)?.text, 100))} | ${fmt(oldItem)} | ${fmt(newItem)} |${rerankRun ? ` ${fmt(reranked)} |` : ''} ${owners.join('+') || '—'} |\n`;
         });
-        text += `\nV9 独占召回用于人工判断是否抵达 V8.3 看不见的有效记忆；V8.3 独占项用于检查 V9 是否发生召回损失或主题漂移。\n`;
+        text += `\nV9 独占召回用于人工判断是否抵达 V8.3 看不见的有效记忆；V8.3 独占项用于检查 V9 是否发生召回损失或主题漂移。Rerank（开启时）在两版本 Top-K 并集上建立独立横向基线。\n`;
         text += `[--- 模式 B 结束 ---]\n`;
         return text;
     }
