@@ -5,10 +5,10 @@
         <span class="material-symbols-outlined">experiment</span>
         <div>
           <div class="v9-console__eyebrow">TagMemo Dual Track Laboratory</div>
-          <h3>V8.3 / V9 双轨实验控制台</h3>
+          <h3>V8.3 / V9.1 双轨实验控制台</h3>
           <p>
-            生产出口默认保持 V8.3；V9 在同一图事实底座上构建有界传播核，供 LightMemo
-            A/B 寻址与灰度测试使用。
+            V9 标识现已承载 V9.1：在有界传播核上加入入流枢纽校正、软非回溯与
+            归一化有限时域场，供 LightMemo A/B 寻址与灰度测试使用。
           </p>
         </div>
       </div>
@@ -47,7 +47,7 @@
           <span class="v9-field__label">生产活动版本</span>
           <UiSelect :model-value="activeVersion" @update:model-value="setVersionField('activeVersion', $event)">
             <option value="v8_3">V8.3 — 兼容生产路径</option>
-            <option value="v9">V9 — 有界传播实验路径</option>
+            <option value="v9">V9.1 — 枢纽免疫实验路径</option>
           </UiSelect>
           <small>决定普通未显式指定版本的查询使用哪套完整资产包。</small>
         </label>
@@ -56,7 +56,7 @@
           <span class="v9-field__label">生产回退版本</span>
           <UiSelect :model-value="fallbackVersion" @update:model-value="setVersionField('fallbackVersion', $event)">
             <option value="v8_3">V8.3 — 推荐安全回退</option>
-            <option value="v9">V9 — 仅开发环境建议</option>
+            <option value="v9">V9.1 — 仅开发环境建议</option>
           </UiSelect>
           <small>只有隐式生产请求允许回退；显式版本请求不会使用此项冒充成功。</small>
         </label>
@@ -91,8 +91,8 @@
       <article class="v9-card v9-card--kernel">
         <header class="v9-card__header">
           <div>
-            <span class="v9-card__kicker">Bounded Kernel</span>
-            <h4>V9 有界传播与虫洞预算</h4>
+            <span class="v9-card__kicker">Hub-aware Bounded Kernel</span>
+            <h4>V9.1 有界传播、枢纽校正与虫洞预算</h4>
           </div>
           <UiBadge variant="danger">高敏感</UiBadge>
         </header>
@@ -108,6 +108,7 @@
           <small>归一化后每个节点所有出边传导率之和不超过该预算。</small>
         </div>
 
+        <div class="v9-kernel-grid">
         <NumericField
           label="出流总质量"
           description="控制每跳最多保留多少传播质量；必须不大于 1。"
@@ -143,6 +144,101 @@
           :max="3"
           :step="0.01"
           @update:model-value="setV9Number('tensionThreshold', $event)"
+        />
+        <NumericField
+          label="虫洞预留质量"
+          description="从节点既有出流预算内预留给虫洞条件分布，不会增加总能量。"
+          :model-value="v9.associationReserveMass"
+          :min="0"
+          :max="0.25"
+          :step="0.01"
+          @update:model-value="setV9Number('associationReserveMass', $event)"
+        />
+        <NumericField
+          label="枢纽惩罚指数 η"
+          description="按目标节点相对入流执行幂律抑制；0 表示关闭枢纽校正。"
+          :model-value="v9.hubPenaltyExponent"
+          :min="0"
+          :max="1"
+          :step="0.01"
+          @update:model-value="setV9Number('hubPenaltyExponent', $event)"
+        />
+        <NumericField
+          label="枢纽倍率下限"
+          description="保护真实高入流核心概念，避免被枢纽校正无限压低。"
+          :model-value="v9.hubPenaltyFloor"
+          :min="0.05"
+          :max="1"
+          :step="0.01"
+          @update:model-value="setV9Number('hubPenaltyFloor', $event)"
+        />
+        <NumericField
+          label="长尾倍率上限"
+          description="限制稀有目标获得的最大相对奖励，防止长尾噪声被过度放大。"
+          :model-value="v9.hubPenaltyCeiling"
+          :min="1"
+          :max="4"
+          :step="0.01"
+          @update:model-value="setV9Number('hubPenaltyCeiling', $event)"
+        />
+        <NumericField
+          label="入流平滑比例"
+          description="以全图正入流中位数为尺度加入平滑项，降低小样本波动。"
+          :model-value="v9.hubSmoothingRatio"
+          :min="0.01"
+          :max="2"
+          :step="0.01"
+          @update:model-value="setV9Number('hubSmoothingRatio', $event)"
+        />
+        </div>
+      </article>
+
+      <article class="v9-card v9-card--dynamics">
+        <header class="v9-card__header">
+          <div>
+            <span class="v9-card__kicker">Path Dynamics</span>
+            <h4>V9.1 软非回溯与有限时域场</h4>
+          </div>
+          <UiBadge variant="warning">仅作用于 V9</UiBadge>
+        </header>
+
+        <div class="v9-budget">
+          <div>
+            <span>立即回流保留比例</span>
+            <strong>{{ formatNumber(spikeRouting.v91ReturnFlowFactor) }}</strong>
+          </div>
+          <div class="v9-budget__track">
+            <span :style="{ width: `${clamp(spikeRouting.v91ReturnFlowFactor, 0, 1) * 100}%` }"></span>
+          </div>
+          <small>0 为严格非回溯，1 为保留旧传播行为；默认 0.15 强抑制双向回声。</small>
+        </div>
+
+        <NumericField
+          label="立即回流保留比例"
+          description="对 u→i→u 的立即返回电流乘此系数；普通汇聚路径不受影响。"
+          :model-value="spikeRouting.v91ReturnFlowFactor"
+          :min="0"
+          :max="1"
+          :step="0.01"
+          @update:model-value="setSpikeNumber('v91ReturnFlowFactor', $event)"
+        />
+        <NumericField
+          label="有限场衰减 γ"
+          description="控制归一化几何跳权重；越小越偏向种子和近跳，越大越保留远跳。"
+          :model-value="spikeRouting.v91FirGamma"
+          :min="0.05"
+          :max="0.95"
+          :step="0.01"
+          @update:model-value="setSpikeNumber('v91FirGamma', $event)"
+        />
+        <NumericField
+          label="最大传播状态数"
+          description="带前驱边状态的查询级硬上限，超出时保留能量最高的状态。"
+          :model-value="spikeRouting.v91MaxPropagationStates"
+          :min="100"
+          :max="20000"
+          :step="100"
+          @update:model-value="setSpikeNumber('v91MaxPropagationStates', $event)"
         />
       </article>
 
@@ -228,12 +324,28 @@ const emit = defineEmits<{
 }>();
 
 const versioning = computed(() => asRecord(props.modelValue.tagMemoVersioning));
-const v9 = computed(() => ({
-  outboundMass: numberValue(asRecord(props.modelValue.v9).outboundMass, 0.95),
-  evidenceCompression: numberValue(asRecord(props.modelValue.v9).evidenceCompression, 1),
-  wormholeGain: numberValue(asRecord(props.modelValue.v9).wormholeGain, 1.35),
-  tensionThreshold: numberValue(asRecord(props.modelValue.v9).tensionThreshold, 1),
-}));
+const v9 = computed(() => {
+  const raw = asRecord(props.modelValue.v9);
+  return {
+    outboundMass: numberValue(raw.outboundMass, 0.95),
+    evidenceCompression: numberValue(raw.evidenceCompression, 1),
+    wormholeGain: numberValue(raw.wormholeGain, 1.35),
+    tensionThreshold: numberValue(raw.tensionThreshold, 1),
+    associationReserveMass: numberValue(raw.associationReserveMass, 0.05),
+    hubPenaltyExponent: numberValue(raw.hubPenaltyExponent, 0.3),
+    hubPenaltyFloor: numberValue(raw.hubPenaltyFloor, 0.55),
+    hubPenaltyCeiling: numberValue(raw.hubPenaltyCeiling, 1.8),
+    hubSmoothingRatio: numberValue(raw.hubSmoothingRatio, 0.1),
+  };
+});
+const spikeRouting = computed(() => {
+  const raw = asRecord(props.modelValue.spikeRouting);
+  return {
+    v91ReturnFlowFactor: numberValue(raw.v91ReturnFlowFactor, 0.15),
+    v91FirGamma: numberValue(raw.v91FirGamma, 0.6),
+    v91MaxPropagationStates: numberValue(raw.v91MaxPropagationStates, 2000),
+  };
+});
 const residual = computed(() => {
   const raw = asRecord(props.modelValue.intrinsicResidual);
   return {
@@ -260,8 +372,8 @@ const activeVersion = computed(() => stringValue(versioning.value.activeVersion,
 const fallbackVersion = computed(() => stringValue(versioning.value.fallbackVersion, "v8_3"));
 const dualArtifacts = computed(() => booleanValue(versioning.value.dualArtifacts, true));
 const strictExplicitVersion = computed(() => booleanValue(versioning.value.strictExplicitVersion, true));
-const activeVersionLabel = computed(() => activeVersion.value === "v9" ? "V9" : "V8.3");
-const fallbackVersionLabel = computed(() => fallbackVersion.value === "v9" ? "V9" : "V8.3");
+const activeVersionLabel = computed(() => activeVersion.value === "v9" ? "V9.1" : "V8.3");
+const fallbackVersionLabel = computed(() => fallbackVersion.value === "v9" ? "V9.1" : "V8.3");
 
 function asRecord(value: ParamValue | undefined): LooseRecord {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -303,6 +415,10 @@ function setVersionBoolean(key: string, event: Event): void {
 
 function setV9Number(key: string, value: number): void {
   updateSection("v9", key, value);
+}
+
+function setSpikeNumber(key: string, value: number): void {
+  updateSection("spikeRouting", key, value);
 }
 
 function setResidualField(key: string, value: string | number): void {
@@ -432,8 +548,30 @@ function formatNumber(value: number): string {
   background: color-mix(in srgb, var(--primary-bg) 44%, transparent);
 }
 
-.v9-card--residual {
+/* 短卡片先并排，参数较多的 Kernel 与 Residual 各自横跨整行。 */
+.v9-card--version {
+  order: 1;
+}
+
+.v9-card--dynamics {
+  order: 2;
+  border-color: color-mix(in srgb, var(--warning-border) 48%, var(--border-color));
+}
+
+.v9-card--kernel {
+  order: 3;
   grid-column: 1 / -1;
+}
+
+.v9-card--residual {
+  order: 4;
+  grid-column: 1 / -1;
+}
+
+.v9-kernel-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
 }
 
 .v9-card__header h4 {
@@ -540,12 +678,14 @@ function formatNumber(value: number): string {
 
 @media (max-width: 1100px) {
   .v9-console__grid,
-  .v9-residual-grid {
+  .v9-residual-grid,
+  .v9-kernel-grid {
     grid-template-columns: 1fr 1fr;
   }
 
+  .v9-card--kernel,
   .v9-card--residual {
-    grid-column: auto;
+    grid-column: 1 / -1;
   }
 }
 
@@ -565,8 +705,14 @@ function formatNumber(value: number): string {
   }
 
   .v9-console__grid,
-  .v9-residual-grid {
+  .v9-residual-grid,
+  .v9-kernel-grid {
     grid-template-columns: 1fr;
+  }
+
+  .v9-card--kernel,
+  .v9-card--residual {
+    grid-column: auto;
   }
 }
 </style>

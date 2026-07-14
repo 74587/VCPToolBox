@@ -58,10 +58,16 @@
       "strictExplicitVersion": true
     },
     "v9": {
+      "algorithmVersion": "v9.1",
       "outboundMass": 0.95,
       "evidenceCompression": 1,
       "wormholeGain": 1.35,
-      "tensionThreshold": 1
+      "tensionThreshold": 1,
+      "associationReserveMass": 0.05,
+      "hubPenaltyExponent": 0.3,
+      "hubPenaltyFloor": 0.55,
+      "hubPenaltyCeiling": 1.8,
+      "hubSmoothingRatio": 0.1
     },
     "intrinsicResidual": {
       "method": "anchored_gs",
@@ -99,7 +105,10 @@
       "wormholeDecay": 0.7,
       "tensionThreshold": 1,
       "maxEmergentNodes": 50,
-      "maxNeighborsPerNode": 20
+      "maxNeighborsPerNode": 20,
+      "v91ReturnFlowFactor": 0.15,
+      "v91FirGamma": 0.6,
+      "v91MaxPropagationStates": 2000
     },
     "orderedCooccurrence": {
       "forwardGain": 1,

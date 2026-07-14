@@ -317,19 +317,26 @@ class TagMemoEngine {
         const kernel = new Map();
         const wormholeEdges = new Set();
         const outboundMass = Math.max(0.01, Math.min(1, Number(v9Config.outboundMass ?? 0.95)));
-        // V9.0.1 Association Probe：只在既有虫洞存在时，从总出流预算内部
-        // 重分配最多 0.05 给虫洞条件分布；不增加总能量，也不改变虫洞判据。
-        const associationReserveMass = Math.min(0.05, outboundMass);
+        // V9.1 仍让虫洞在总预算内竞争；association reserve 不产生额外能量。
+        const associationReserveMass = Math.min(
+            Math.max(0, Number(v9Config.associationReserveMass ?? 0.05)),
+            outboundMass
+        );
         const evidenceCompression = Math.max(0.01, Number(v9Config.evidenceCompression ?? 1));
         const wormholeGain = Math.max(1, Number(v9Config.wormholeGain ?? 1.35));
         const tensionThreshold = Math.max(0, Number(v9Config.tensionThreshold ?? 1));
+        const hubPenaltyExponent = Math.max(0, Math.min(1, Number(v9Config.hubPenaltyExponent ?? 0.3)));
+        const hubPenaltyFloor = Math.max(0.05, Math.min(1, Number(v9Config.hubPenaltyFloor ?? 0.55)));
+        const hubPenaltyCeiling = Math.max(1, Math.min(4, Number(v9Config.hubPenaltyCeiling ?? 1.8)));
+        const hubSmoothingRatio = Math.max(0.01, Math.min(2, Number(v9Config.hubSmoothingRatio ?? 0.1)));
 
+        // 第一遍：保留每条边的未归一化证据，并统计目标节点吸收的全图入流。
+        // 入流统计必须发生在行归一化之前，否则无法识别“从许多来源吸积少量质量”的通用枢纽。
+        const rawRows = new Map();
+        const targetInflows = new Map();
         for (const [sourceId, edges] of v83Matrix.entries()) {
             if (!(edges instanceof Map) || edges.size === 0) continue;
             const rawEdges = [];
-            let rawSum = 0;
-            let wormholeRawSum = 0;
-
             for (const [targetId, compatWeight] of edges.entries()) {
                 const evidence = Math.log1p(Math.max(0, Number(compatWeight) || 0) * evidenceCompression);
                 const residual = residualMap?.get(targetId) ?? 1;
@@ -337,27 +344,67 @@ class TagMemoEngine {
                 const rawConductance = evidence * (isWormhole ? wormholeGain : 1);
                 if (!Number.isFinite(rawConductance) || rawConductance <= 0) continue;
                 rawEdges.push([targetId, rawConductance, isWormhole]);
-                rawSum += rawConductance;
-                if (isWormhole) wormholeRawSum += rawConductance;
+                targetInflows.set(targetId, (targetInflows.get(targetId) || 0) + rawConductance);
+            }
+            if (rawEdges.length > 0) rawRows.set(sourceId, rawEdges);
+        }
+
+        const positiveInflows = [...targetInflows.values()]
+            .filter(value => Number.isFinite(value) && value > 0)
+            .sort((a, b) => a - b);
+        const medianInflow = positiveInflows.length > 0
+            ? positiveInflows[Math.floor(positiveInflows.length / 2)]
+            : 1;
+        const smoothing = Math.max(1e-9, medianInflow * hubSmoothingRatio);
+
+        // 第二遍：按“相对中位入流”温和抑制枢纽，再统一归一化到固定行预算。
+        // 夹逼防止罕见节点被无限奖励，也防止真实核心概念被过度压低。
+        for (const [sourceId, rawEdges] of rawRows.entries()) {
+            const adjustedEdges = [];
+            let adjustedSum = 0;
+            let wormholeAdjustedSum = 0;
+
+            for (const [targetId, rawConductance, isWormhole] of rawEdges) {
+                const relativeInflow = (targetInflows.get(targetId) || 0) / (medianInflow + smoothing);
+                const rawPenalty = hubPenaltyExponent > 0
+                    ? Math.pow(Math.max(1e-9, relativeInflow), -hubPenaltyExponent)
+                    : 1;
+                const hubPenalty = Math.max(hubPenaltyFloor, Math.min(hubPenaltyCeiling, rawPenalty));
+                const adjustedConductance = rawConductance * hubPenalty;
+                if (!Number.isFinite(adjustedConductance) || adjustedConductance <= 0) continue;
+                adjustedEdges.push([targetId, adjustedConductance, isWormhole]);
+                adjustedSum += adjustedConductance;
+                if (isWormhole) wormholeAdjustedSum += adjustedConductance;
             }
 
-            if (rawSum <= 0) continue;
+            if (adjustedSum <= 0) continue;
             const normalizedEdges = new Map();
-            const reserveMass = wormholeRawSum > 0 ? associationReserveMass : 0;
+            const reserveMass = wormholeAdjustedSum > 0 ? associationReserveMass : 0;
             const mainMass = outboundMass - reserveMass;
-            for (const [targetId, rawConductance, isWormhole] of rawEdges) {
-                const mainConductance = mainMass * rawConductance / rawSum;
-                const associationConductance = isWormhole && wormholeRawSum > 0
-                    ? reserveMass * rawConductance / wormholeRawSum
+            for (const [targetId, adjustedConductance, isWormhole] of adjustedEdges) {
+                const mainConductance = mainMass * adjustedConductance / adjustedSum;
+                const associationConductance = isWormhole && wormholeAdjustedSum > 0
+                    ? reserveMass * adjustedConductance / wormholeAdjustedSum
                     : 0;
-                const conductance = mainConductance + associationConductance;
-                normalizedEdges.set(targetId, conductance);
+                normalizedEdges.set(targetId, mainConductance + associationConductance);
                 if (isWormhole) wormholeEdges.add(`${sourceId}:${targetId}`);
             }
             kernel.set(sourceId, normalizedEdges);
         }
 
-        return { kernel, wormholeEdges, outboundMass };
+        return {
+            kernel,
+            wormholeEdges,
+            outboundMass,
+            kernelDiagnostics: Object.freeze({
+                algorithmVersion: 'v9.1-hub-aware',
+                medianInflow,
+                targetCount: targetInflows.size,
+                hubPenaltyExponent,
+                hubPenaltyFloor,
+                hubPenaltyCeiling
+            })
+        };
     }
 
     _buildBoundedV83PropagationKernel(v83Matrix, residualMap, config = {}) {
@@ -460,7 +507,9 @@ class TagMemoEngine {
             }),
             v9: makeStaging('v9', v9Generation, v9ResidualMap, v9Build.kernel, {
                 wormholeEdges: v9Build.wormholeEdges,
-                outboundMass: v9Build.outboundMass
+                outboundMass: v9Build.outboundMass,
+                kernelDiagnostics: v9Build.kernelDiagnostics,
+                algorithmVersion: 'v9.1'
             })
         }, versionConfig.activeVersion || 'v8_3');
     }
@@ -534,6 +583,142 @@ class TagMemoEngine {
         if (this.epa) {
             // 如果 EPA 支持动态更新参数，可以在这里调用
         }
+    }
+
+    _propagateSpikes(initialTags, queryMatrix, queryResiduals, queryWormholeEdges, srConfig = {}, queryVersion = 'v8_3') {
+        const MAX_SAFE_HOPS = srConfig.maxSafeHops ?? 4;
+        const BASE_MOMENTUM = srConfig.baseMomentum ?? 2.0;
+        const FIRING_THRESHOLD = srConfig.firingThreshold ?? 0.10;
+        const BASE_DECAY = srConfig.baseDecay ?? 0.25;
+        const WORMHOLE_DECAY = srConfig.wormholeDecay ?? 0.70;
+        const TENSION_THRESHOLD = srConfig.tensionThreshold ?? 1.0;
+        const MAX_NEIGHBORS_PER_NODE = srConfig.maxNeighborsPerNode ?? 20;
+        const isV91 = queryVersion === 'v9';
+
+        // V9.1 使用有前驱记忆的传播状态，精确识别 i→j→i 的立即回流。
+        // 状态数量设硬上限，防止边状态在高分支图中指数增长。
+        const returnFlowFactor = Math.max(0, Math.min(1, Number(srConfig.v91ReturnFlowFactor ?? 0.15)));
+        const firGamma = Math.max(0.05, Math.min(0.95, Number(srConfig.v91FirGamma ?? 0.6)));
+        const maxPropagationStates = Math.max(100, Math.floor(Number(srConfig.v91MaxPropagationStates ?? 2000)));
+        const firWeights = [];
+        let firWeightSum = 0;
+        for (let hop = 0; hop <= MAX_SAFE_HOPS; hop++) {
+            const weight = isV91 ? Math.pow(firGamma, hop) : 1;
+            firWeights.push(weight);
+            firWeightSum += weight;
+        }
+        if (isV91 && firWeightSum > 0) {
+            for (let hop = 0; hop < firWeights.length; hop++) firWeights[hop] /= firWeightSum;
+        }
+
+        // key 为 prev:node；V8.3 继续用 node key，严格保持旧的节点聚合行为。
+        let activeSpikes = new Map();
+        const accumulatedEnergy = new Map();
+        for (const tag of initialTags) {
+            const key = isV91 ? `seed:${tag.id}` : tag.id;
+            activeSpikes.set(key, {
+                nodeId: tag.id,
+                previousNodeId: null,
+                energy: tag.adjustedWeight,
+                momentum: BASE_MOMENTUM
+            });
+            accumulatedEnergy.set(tag.id, tag.adjustedWeight * firWeights[0]);
+        }
+
+        const diagnostics = {
+            algorithmVersion: isV91 ? 'v9.1-soft-nonbacktracking-fir' : 'v8.3-compatible',
+            returnFlowSuppressedMass: 0,
+            stateTruncations: 0,
+            hopInFlightMass: []
+        };
+
+        for (let hop = 0; hop < MAX_SAFE_HOPS; hop++) {
+            const nextSpikes = new Map();
+            let propagated = false;
+            let inFlightMass = 0;
+
+            for (const spike of activeSpikes.values()) {
+                if (spike.energy < FIRING_THRESHOLD || spike.momentum < 0) continue;
+                const synapses = queryMatrix.get(spike.nodeId);
+                if (!synapses) continue;
+
+                const sortedSynapses = Array.from(synapses.entries())
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, MAX_NEIGHBORS_PER_NODE);
+
+                for (const [neighborId, coocWeight] of sortedSynapses) {
+                    const neighborResidual = queryResiduals?.get(neighborId) ?? 1.0;
+                    const tension = coocWeight * neighborResidual;
+                    const isWormhole = queryWormholeEdges instanceof Set
+                        ? queryWormholeEdges.has(`${spike.nodeId}:${neighborId}`)
+                        : tension >= TENSION_THRESHOLD;
+                    const decayFactor = isWormhole ? WORMHOLE_DECAY : BASE_DECAY;
+                    const momentumCost = isWormhole ? 0 : 1.0;
+                    const isImmediateReturn = isV91
+                        && spike.previousNodeId !== null
+                        && neighborId === spike.previousNodeId;
+                    const flowFactor = isImmediateReturn ? returnFlowFactor : 1;
+                    const unpenalizedCurrent = spike.energy * coocWeight * decayFactor;
+                    const injectedCurrent = unpenalizedCurrent * flowFactor;
+                    if (isImmediateReturn) {
+                        diagnostics.returnFlowSuppressedMass += unpenalizedCurrent - injectedCurrent;
+                    }
+                    if (injectedCurrent < 0.01) continue;
+
+                    const nextMomentum = spike.momentum - momentumCost;
+                    if (nextMomentum < 0 && !isWormhole) continue;
+
+                    const stateKey = isV91
+                        ? `${spike.nodeId}:${neighborId}`
+                        : neighborId;
+                    const existing = nextSpikes.get(stateKey);
+                    if (existing) {
+                        existing.energy += injectedCurrent;
+                        existing.momentum = Math.max(existing.momentum, nextMomentum);
+                    } else {
+                        nextSpikes.set(stateKey, {
+                            nodeId: neighborId,
+                            previousNodeId: isV91 ? spike.nodeId : null,
+                            energy: injectedCurrent,
+                            momentum: nextMomentum
+                        });
+                    }
+                }
+            }
+
+            if (isV91 && nextSpikes.size > maxPropagationStates) {
+                const retained = [...nextSpikes.entries()]
+                    .sort((a, b) => b[1].energy - a[1].energy)
+                    .slice(0, maxPropagationStates);
+                diagnostics.stateTruncations += nextSpikes.size - retained.length;
+                nextSpikes.clear();
+                for (const [key, value] of retained) nextSpikes.set(key, value);
+            }
+
+            const nodeEnergyThisHop = new Map();
+            for (const newSpike of nextSpikes.values()) {
+                nodeEnergyThisHop.set(
+                    newSpike.nodeId,
+                    (nodeEnergyThisHop.get(newSpike.nodeId) || 0) + newSpike.energy
+                );
+                inFlightMass += newSpike.energy;
+            }
+            diagnostics.hopInFlightMass.push(inFlightMass);
+
+            const fieldWeight = firWeights[hop + 1];
+            for (const [nodeId, energy] of nodeEnergyThisHop.entries()) {
+                accumulatedEnergy.set(
+                    nodeId,
+                    (accumulatedEnergy.get(nodeId) || 0) + energy * fieldWeight
+                );
+                if (energy > 0.01) propagated = true;
+            }
+
+            if (!propagated) break;
+            activeSpikes = nextSpikes;
+        }
+
+        return { accumulatedEnergy, diagnostics };
     }
 
     /**
@@ -683,89 +868,23 @@ class TagMemoEngine {
 
             // [4.5] 仿脑认知扩散 (Spike Propagation / Lif-Router)
             // 🔧 重构 V7：动量与残差张力驱动的虫洞跃迁 (Wormhole Routing)
+            let propagationDiagnostics = null;
             if (allTags.length > 0 && queryMatrix) {
                 const srConfig = config.spikeRouting || {};
-                const MAX_SAFE_HOPS = srConfig.maxSafeHops ?? 4;
-                const BASE_MOMENTUM = srConfig.baseMomentum ?? 2.0;
-                const FIRING_THRESHOLD = srConfig.firingThreshold ?? 0.10;
-                const BASE_DECAY = srConfig.baseDecay ?? 0.25;
-                const WORMHOLE_DECAY = srConfig.wormholeDecay ?? 0.70;
-                const TENSION_THRESHOLD = srConfig.tensionThreshold ?? 1.0;
                 const MAX_EMERGENT_NODES = srConfig.maxEmergentNodes ?? 50;
-                const MAX_NEIGHBORS_PER_NODE = srConfig.maxNeighborsPerNode ?? 20;
 
-                // 1. 初始注入：带有“动量(TTL)”的脉冲发射器
-                let activeSpikes = new Map();      // id -> { energy, momentum }
-                const accumulatedEnergy = new Map(); // id -> energySum 全局能量累加器
-                
-                allTags.forEach(t => {
-                    activeSpikes.set(t.id, { energy: t.adjustedWeight, momentum: BASE_MOMENTUM });
-                    accumulatedEnergy.set(t.id, t.adjustedWeight);
-                });
+                const propagation = this._propagateSpikes(
+                    allTags,
+                    queryMatrix,
+                    queryResiduals,
+                    queryWormholeEdges,
+                    srConfig,
+                    queryVersion
+                );
+                const accumulatedEnergy = propagation.accumulatedEnergy;
+                propagationDiagnostics = propagation.diagnostics;
 
-                // 2. 迭代扩散网络 (基于动量与张力驱动)
-                for (let hop = 0; hop < MAX_SAFE_HOPS; hop++) {
-                    const nextSpikes = new Map();
-                    let propagated = false;
-
-                    for (const [nodeId, spike] of activeSpikes.entries()) {
-                        if (spike.energy < FIRING_THRESHOLD || spike.momentum < 0) continue;
-
-                        const synapses = queryMatrix.get(nodeId);
-                        if (!synapses) continue;
-
-                        const sortedSynapses = Array.from(synapses.entries())
-                            .sort((a, b) => b[1] - a[1])
-                            .slice(0, MAX_NEIGHBORS_PER_NODE);
-
-                        for (const [neighborId, coocWeight] of sortedSynapses) {
-                            // TagMemo V7: Wormhole Routing
-                            // 张力 = 目标节点的残差新颖度 * 边权重
-                            const neighborResidual = queryResiduals?.get(neighborId) ?? 1.0;
-                            const tension = coocWeight * neighborResidual;
-                            
-                            // V9 虫洞已经在归一化前进入 raw conductance；传播期只读取判定，
-                            // 不再额外创造出流质量。V8.3 保持原判据不变。
-                            const isWormhole = queryWormholeEdges instanceof Set
-                                ? queryWormholeEdges.has(`${nodeId}:${neighborId}`)
-                                : tension >= TENSION_THRESHOLD;
-                            
-                            // 能量衰减与动量消耗策略
-                            const decayFactor = isWormhole ? WORMHOLE_DECAY : BASE_DECAY;
-                            const momentumCost = isWormhole ? 0 : 1.0; // 穿越虫洞豁免动量消耗
-
-                            const injectedCurrent = spike.energy * coocWeight * decayFactor;
-                            
-                            if (injectedCurrent < 0.01) continue;
-                            
-                            const nextMomentum = spike.momentum - momentumCost;
-                            if (nextMomentum < 0 && !isWormhole) continue; // 动量耗尽且非虫洞，则停止传播
-
-                            // 聚合到达同一节点的脉冲
-                            const existing = nextSpikes.get(neighborId);
-                            if (existing) {
-                                existing.energy += injectedCurrent;
-                                existing.momentum = Math.max(existing.momentum, nextMomentum); // 继承最优动量
-                            } else {
-                                nextSpikes.set(neighborId, { energy: injectedCurrent, momentum: nextMomentum });
-                            }
-                        }
-                    }
-
-                    // 3. 将新一波激发的电流叠加到全局激活总图中
-                    for (const [nid, newSpike] of nextSpikes.entries()) {
-                        const currentSum = accumulatedEnergy.get(nid) || 0;
-                        accumulatedEnergy.set(nid, currentSum + newSpike.energy);
-                        if (newSpike.energy > 0.01) propagated = true;
-                    }
-
-                    if (!propagated) break;
-                    
-                    // 下一跳的火种
-                    activeSpikes = nextSpikes;
-                }
-
-                // 🌟 V8: 缓存距离场（供 geodesicRerank 使用）
+                // 查询级缓存仅用于返回；并发搜索必须继续显式传递 energyField。
                 this.lastEnergyField = accumulatedEnergy;
 
                 // 4. 将涌现出来的高电位节点，重新塞回到 allTags
@@ -1009,7 +1128,9 @@ class TagMemoEngine {
                     graphGeneration: artifactBundle?.graphGeneration || null,
                     artifactGeneration: artifactBundle?.generation || null,
                     epa: { logicDepth, entropy: entropyPenalty, resonance: resonance.resonance },
-                    pyramid: { coverage: features.coverage, novelty: features.novelty, depth: features.depth }
+                    pyramid: { coverage: features.coverage, novelty: features.novelty, depth: features.depth },
+                    propagation: propagationDiagnostics,
+                    algorithmVersion: artifactBundle?.algorithmVersion || queryVersion
                 }
             };
 
