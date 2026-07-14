@@ -48,7 +48,7 @@
   },
   "KnowledgeBaseManager": {
     "tagMemoVersioning": {
-      "activeVersion": "v8_3",
+      "activeVersion": "v9",
       "fallbackVersion": "v8_3",
       "availableVersions": [
         "v8_3",
