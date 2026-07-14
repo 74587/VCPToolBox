@@ -360,6 +360,42 @@ class TagMemoEngine {
         return { kernel, wormholeEdges, outboundMass };
     }
 
+    _buildBoundedV83PropagationKernel(v83Matrix, residualMap, config = {}) {
+        const kernel = new Map();
+        const wormholeEdges = new Set();
+        const outboundMass = Math.max(0.01, Math.min(1, Number(config.outboundMass ?? 0.95)));
+        const tensionThreshold = Math.max(0, Number(config.tensionThreshold ?? 1.0));
+
+        for (const [sourceId, edges] of v83Matrix.entries()) {
+            if (!(edges instanceof Map) || edges.size === 0) continue;
+
+            let rowSum = 0;
+            for (const weight of edges.values()) {
+                const numericWeight = Math.max(0, Number(weight) || 0);
+                rowSum += numericWeight;
+            }
+            if (!Number.isFinite(rowSum) || rowSum <= 0) continue;
+
+            const normalizedEdges = new Map();
+            for (const [targetId, weight] of edges.entries()) {
+                const rawWeight = Math.max(0, Number(weight) || 0);
+                if (rawWeight <= 0) continue;
+
+                // 虫洞身份沿用 V8.3 原始累计权重判定；只修复传播电流尺度，
+                // 避免归一化后阈值口径变化导致虫洞机制被意外关闭。
+                const residual = residualMap?.get(targetId) ?? 1.0;
+                if (rawWeight * residual >= tensionThreshold) {
+                    wormholeEdges.add(`${sourceId}:${targetId}`);
+                }
+
+                normalizedEdges.set(targetId, outboundMass * rawWeight / rowSum);
+            }
+            if (normalizedEdges.size > 0) kernel.set(sourceId, normalizedEdges);
+        }
+
+        return { kernel, wormholeEdges, outboundMass };
+    }
+
     _stageAndPublishDualBundles(v83Matrix) {
         const pairwiseView = this.tagPairSimilarities instanceof Map
             ? this.tagPairSimilarities
@@ -375,11 +411,17 @@ class TagMemoEngine {
         ));
         const versionConfig = kbConfig.tagMemoVersioning || {};
         const v9Config = kbConfig.v9 || {};
+        const v83Config = {
+            outboundMass: v9Config.outboundMass ?? 0.95,
+            tensionThreshold: kbConfig.spikeRouting?.tensionThreshold ?? 1.0
+        };
         const potentialFieldConfig = kbConfig.potentialFieldRerank
             || kbConfig.geodesicRerank
             || {};
+        // 两版都从同一个原始累计事实矩阵独立构核，避免 V9 二次归一化 V8.3 查询核。
+        const v83Build = this._buildBoundedV83PropagationKernel(v83Matrix, v83ResidualMap, v83Config);
         const v9Build = this._buildV9PropagationKernel(v83Matrix, v9ResidualMap, v9Config);
-        const v83Generation = this._computeGraphGeneration(v83Matrix, pairwiseView, v83ResidualMap);
+        const v83Generation = this._computeGraphGeneration(v83Build.kernel, pairwiseView, v83ResidualMap);
         const v9Generation = this._computeGraphGeneration(v9Build.kernel, pairwiseView, v9ResidualMap);
 
         const makeStaging = (version, graphGeneration, residualMap, propagationKernel, extras = {}) => {
@@ -412,7 +454,10 @@ class TagMemoEngine {
         };
 
         return this._publishArtifactBundles({
-            v8_3: makeStaging('v8_3', v83Generation, v83ResidualMap, v83Matrix),
+            v8_3: makeStaging('v8_3', v83Generation, v83ResidualMap, v83Build.kernel, {
+                wormholeEdges: v83Build.wormholeEdges,
+                outboundMass: v83Build.outboundMass
+            }),
             v9: makeStaging('v9', v9Generation, v9ResidualMap, v9Build.kernel, {
                 wormholeEdges: v9Build.wormholeEdges,
                 outboundMass: v9Build.outboundMass
@@ -681,8 +726,8 @@ class TagMemoEngine {
                             
                             // V9 虫洞已经在归一化前进入 raw conductance；传播期只读取判定，
                             // 不再额外创造出流质量。V8.3 保持原判据不变。
-                            const isWormhole = queryVersion === 'v9'
-                                ? queryWormholeEdges?.has(`${nodeId}:${neighborId}`) === true
+                            const isWormhole = queryWormholeEdges instanceof Set
+                                ? queryWormholeEdges.has(`${nodeId}:${neighborId}`)
                                 : tension >= TENSION_THRESHOLD;
                             
                             // 能量衰减与动量消耗策略

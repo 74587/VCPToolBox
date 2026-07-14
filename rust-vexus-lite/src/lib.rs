@@ -1783,7 +1783,7 @@ impl Task for IntrinsicResidualTask {
             v9_anchor_min: v9_anchor_min.min(v9_anchor_max),
             v9_anchor_max: v9_anchor_max.max(v9_anchor_min),
         };
-        const INTRINSIC_ALGORITHM_VERSION: &str = "intrinsic_residual_ratio_v9_p0";
+        const INTRINSIC_ALGORITHM_VERSION: &str = "intrinsic_residual_ratio_v9_p0_mad_v83";
         let effective_config = format!(
             "{{\"algorithm\":\"{}\",\"method\":\"{}\",\"dimension\":{},\"maxNeighbors\":{},\"maxBasis\":{},\"minNeighbors\":{},\"semanticEnabled\":{},\"semanticPeak\":{},\"semanticSigma\":{},\"semanticFloor\":{},\"semanticHardFloor\":{},\"minGain\":{},\"positionDecay\":{},\"v9AnchorBase\":{},\"v9AnchorScale\":{},\"v9AnchorGamma\":{},\"v9AnchorMin\":{},\"v9AnchorMax\":{}}}",
             INTRINSIC_ALGORITHM_VERSION,
@@ -2155,7 +2155,32 @@ impl Task for IntrinsicResidualTask {
             let write_started = Instant::now();
             let max_r = results.iter().map(|r| r.1).fold(0.0f64, f64::max);
             let min_r = results.iter().map(|r| r.1).fold(f64::MAX, f64::min);
-            let range = max_r - min_r;
+
+            // V8.3 P0 修复：使用 median/MAD 代替全库 Min-Max。
+            // 极端标签不再重标定全库；1.4826 将 MAD 校准到正态分布标准差尺度。
+            let mut residual_values = results.iter().map(|r| r.1).collect::<Vec<_>>();
+            residual_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_of_sorted = |values: &[f64]| -> f64 {
+                if values.is_empty() {
+                    return 0.0;
+                }
+                let mid = values.len() / 2;
+                if values.len() % 2 == 0 {
+                    (values[mid - 1] + values[mid]) * 0.5
+                } else {
+                    values[mid]
+                }
+            };
+            let residual_median = median_of_sorted(&residual_values);
+            let mut absolute_deviations = residual_values
+                .iter()
+                .map(|value| (value - residual_median).abs())
+                .collect::<Vec<_>>();
+            absolute_deviations
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let residual_mad = median_of_sorted(&absolute_deviations);
+            let robust_scale = (1.4826 * residual_mad).max(1e-9);
+
             let computed_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_millis() as i64)
@@ -2201,12 +2226,10 @@ impl Task for IntrinsicResidualTask {
                 ).map_err(|e| Error::from_reason(format!("Prepare residual value insert failed: {}", e)))?;
 
                 for (tag_id, raw_residual, n_count) in &results {
-                    // V8.3 兼容路径保持旧 Min-Max 映射，确保生产基线可回退。
-                    let v8_3_compat_gain = if range > 1e-9 {
-                        0.5 + 1.5 * ((raw_residual - min_r) / range)
-                    } else {
-                        1.0
-                    };
+                    // V8.3 P0：稳健 Z 分数经 tanh 映射到 [0.5, 2.0]。
+                    // 中位数对应 1.25；极端离群值只能渐近边界，不能压缩主体分布。
+                    let robust_z = (raw_residual - residual_median) / robust_scale;
+                    let v8_3_compat_gain = 1.25 + 0.75 * (robust_z / 2.0).tanh();
                     // V9 使用数据库无关的固定单调映射。
                     let v9_anchor_gain = (cfg.v9_anchor_base
                         + cfg.v9_anchor_scale * raw_residual.powf(cfg.v9_anchor_gamma))
@@ -2260,12 +2283,14 @@ impl Task for IntrinsicResidualTask {
                 .map_err(|e| Error::from_reason(format!("Commit failed: {}", e)))?;
 
             println!(
-                "[Vexus-Lite][IntrinsicResidual] write phase finished: values={}, statuses={}, artifact={}, raw_min={:.6}, raw_max={:.6}, elapsed={:.2}ms",
+                "[Vexus-Lite][IntrinsicResidual] write phase finished: values={}, statuses={}, artifact={}, raw_min={:.6}, raw_max={:.6}, median={:.6}, mad={:.6}, elapsed={:.2}ms",
                 results.len(),
                 status_results.len(),
                 artifact_sig,
                 if results.is_empty() { 0.0 } else { min_r },
                 max_r,
+                residual_median,
+                residual_mad,
                 write_started.elapsed().as_secs_f64() * 1000.0
             );
         }
