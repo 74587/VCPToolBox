@@ -1485,7 +1485,12 @@ struct IntrinsicResidualConfigInput {
 }
 
 fn intrinsic_method_from_name(value: Option<&str>) -> IntrinsicResidualMethod {
-    match value.unwrap_or("anchored_gs").trim().to_ascii_lowercase().as_str() {
+    match value
+        .unwrap_or("anchored_gs")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "centroid" => IntrinsicResidualMethod::Centroid,
         "svd" => IntrinsicResidualMethod::Svd,
         _ => IntrinsicResidualMethod::AnchoredGs,
@@ -1720,9 +1725,13 @@ impl Task for IntrinsicResidualTask {
 
         let start = Instant::now();
         let dim = self.dimensions as usize;
-        let config_input: IntrinsicResidualConfigInput = match self.effective_config_json.as_deref() {
+        let config_input: IntrinsicResidualConfigInput = match self.effective_config_json.as_deref()
+        {
             Some(raw) => serde_json::from_str(raw).map_err(|e| {
-                Error::from_reason(format!("Invalid intrinsic residual effective config JSON: {}", e))
+                Error::from_reason(format!(
+                    "Invalid intrinsic residual effective config JSON: {}",
+                    e
+                ))
             })?,
             None => IntrinsicResidualConfigInput::default(),
         };
@@ -2039,7 +2048,8 @@ impl Task for IntrinsicResidualTask {
         let mut skipped = 0u32;
         let mut total_neighbors = 0usize;
         let mut results: Vec<(i64, f64, usize)> = Vec::new();
-        let mut status_results: Vec<(i64, &'static str, usize, Option<String>)> = Vec::with_capacity(tag_vectors.len());
+        let mut status_results: Vec<(i64, &'static str, usize, Option<String>)> =
+            Vec::with_capacity(tag_vectors.len());
         let compute_started = Instant::now();
 
         for (&tag_id, tag_vec) in &tag_vectors {
@@ -2200,7 +2210,7 @@ impl Task for IntrinsicResidualTask {
                     // V9 使用数据库无关的固定单调映射。
                     let v9_anchor_gain = (cfg.v9_anchor_base
                         + cfg.v9_anchor_scale * raw_residual.powf(cfg.v9_anchor_gamma))
-                        .clamp(cfg.v9_anchor_min, cfg.v9_anchor_max);
+                    .clamp(cfg.v9_anchor_min, cfg.v9_anchor_max);
                     insert
                         .execute(rusqlite::params![
                             tag_id,
@@ -2213,16 +2223,22 @@ impl Task for IntrinsicResidualTask {
                             INTRINSIC_ALGORITHM_VERSION,
                             &config_hash
                         ])
-                        .map_err(|e| Error::from_reason(format!("Residual value insert failed: {}", e)))?;
+                        .map_err(|e| {
+                            Error::from_reason(format!("Residual value insert failed: {}", e))
+                        })?;
                 }
             }
 
             {
-                let mut insert_status = tx.prepare(
-                    "INSERT OR REPLACE INTO tag_intrinsic_residual_status \
+                let mut insert_status = tx
+                    .prepare(
+                        "INSERT OR REPLACE INTO tag_intrinsic_residual_status \
                      (tag_id, artifact_sig, status, neighbor_count, error_message, computed_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-                ).map_err(|e| Error::from_reason(format!("Prepare residual status insert failed: {}", e)))?;
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    )
+                    .map_err(|e| {
+                        Error::from_reason(format!("Prepare residual status insert failed: {}", e))
+                    })?;
 
                 for (tag_id, status, neighbor_count, error_message) in &status_results {
                     insert_status
@@ -2234,7 +2250,9 @@ impl Task for IntrinsicResidualTask {
                             error_message,
                             computed_at
                         ])
-                        .map_err(|e| Error::from_reason(format!("Residual status insert failed: {}", e)))?;
+                        .map_err(|e| {
+                            Error::from_reason(format!("Residual status insert failed: {}", e))
+                        })?;
                 }
             }
 
@@ -2420,7 +2438,9 @@ impl Task for PairwiseSimTask {
                 .query_map(rusqlite::params![&artifact_sig], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                 })
-                .map_err(|e| Error::from_reason(format!("Query pairwise status cache failed: {}", e)))?;
+                .map_err(|e| {
+                    Error::from_reason(format!("Query pairwise status cache failed: {}", e))
+                })?;
 
             for row in rows {
                 if let Ok((a, b)) = row {
@@ -2529,9 +2549,16 @@ impl Task for PairwiseSimTask {
 
             if self.full_rebuild {
                 conn.execute("DELETE FROM tag_pair_similarity", [])
-                    .map_err(|e| Error::from_reason(format!("Full rebuild positive cache clear failed: {}", e)))?;
+                    .map_err(|e| {
+                        Error::from_reason(format!(
+                            "Full rebuild positive cache clear failed: {}",
+                            e
+                        ))
+                    })?;
                 conn.execute("DELETE FROM tag_pair_similarity_status", [])
-                    .map_err(|e| Error::from_reason(format!("Full rebuild status cache clear failed: {}", e)))?;
+                    .map_err(|e| {
+                        Error::from_reason(format!("Full rebuild status cache clear failed: {}", e))
+                    })?;
             }
 
             let artifact_now = now_ms;
@@ -2601,7 +2628,10 @@ impl Task for PairwiseSimTask {
 
             for (chunk_index, chunk) in status_rows.chunks(WRITE_CHUNK_SIZE).enumerate() {
                 let tx = conn.transaction().map_err(|e| {
-                    Error::from_reason(format!("Begin pairwise status tx chunk {} failed: {}", chunk_index, e))
+                    Error::from_reason(format!(
+                        "Begin pairwise status tx chunk {} failed: {}",
+                        chunk_index, e
+                    ))
                 })?;
                 {
                     let mut stmt = tx
@@ -2637,7 +2667,10 @@ impl Task for PairwiseSimTask {
                     }
                 }
                 tx.commit().map_err(|e| {
-                    Error::from_reason(format!("Commit pairwise status tx chunk {} failed: {}", chunk_index, e))
+                    Error::from_reason(format!(
+                        "Commit pairwise status tx chunk {} failed: {}",
+                        chunk_index, e
+                    ))
                 })?;
             }
 
